@@ -8,12 +8,13 @@
  * Ported from v1 — see v1 source for commit history.
  */
 import { execFileSync, execSync, spawn } from 'node:child_process';
-import { existsSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { createConnection, type Socket } from 'node:net';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import type { ChannelAdapter, ChannelDefaults, ChannelSetup, InboundMessage, OutboundMessage } from './adapter.js';
+import { normalizeOptions, type NormalizedOption } from './ask-question.js';
 import { registerChannelAdapter } from './channel-registry.js';
 import { readEnvFile } from '../env.js';
 import { log } from '../log.js';
@@ -314,6 +315,36 @@ interface SignalDataMessage {
   }>;
 }
 
+/** One attachment as signal-cli reports it on an inbound data message. */
+type SignalRawAttachment = NonNullable<SignalDataMessage['attachments']>[number];
+
+/**
+ * A downloaded inbound attachment, carried as base64 `data`. The host stages
+ * the bytes into the session's inbox and rewrites the entry to a `localPath`
+ * — the adapter itself never hands the container a host path.
+ */
+export interface SignalAttachment {
+  type: string;
+  name?: string;
+  mimeType?: string;
+  size: number;
+  data: string;
+}
+
+/**
+ * Coarse media class for an attachment, used as the display label in the
+ * agent prompt and as `deriveAttachmentName`'s fallback when `contentType`
+ * is absent. The real extension comes from `mimeType` whenever signal-cli
+ * reports one.
+ */
+export function signalAttachmentType(contentType: string | undefined): string {
+  if (!contentType) return 'file';
+  if (contentType.startsWith('image/')) return 'image';
+  if (contentType.startsWith('video/')) return 'video';
+  if (contentType.startsWith('audio/')) return 'audio';
+  return 'file';
+}
+
 interface SignalEnvelope {
   source?: string;
   sourceName?: string;
@@ -531,6 +562,30 @@ function parseSignalStyles(input: string): StyledText {
 // ---------------------------------------------------------------------------
 
 /**
+ * Signal renders no interactive cards, so an `ask_question` card is delivered
+ * as text and answered with a slash command — the same fallback the other
+ * native adapters use (see `whatsapp.ts`, `imessage.ts`).
+ *
+ * Unlike those two this strips every non-alphanumeric run rather than only
+ * whitespace: the standing approval card's third button is labelled
+ * "Reject with reason…", and a literal ellipsis in the command would leave it
+ * untypable on a phone keyboard.
+ */
+export function optionToCommand(option: string): string {
+  return (
+    '/' +
+    option
+      .toLowerCase()
+      .trim()
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/^-+|-+$/g, '')
+  );
+}
+
+/** Cap on remembered unanswered questions, oldest evicted first. */
+const PENDING_QUESTIONS_MAX = 64;
+
+/**
  * Platform ID format:
  *   DM:    phone number or UUID (e.g. "+15555550123")
  *   Group: "group:<groupId>" (e.g. "group:abc123")
@@ -545,12 +600,15 @@ export function createSignalAdapter(config: {
   tcpPort: number;
   manageDaemon: boolean;
   signalDataDir: string;
+  maxInlineAttachmentBytes: number;
 }): ChannelAdapter {
   let daemon: DaemonHandle | null = null;
   let tcp: SignalTcpClient | null = null;
   let connected = false;
   const echoCache = new EchoCache();
   let setup: ChannelSetup | null = null;
+  /** Unanswered ask_question cards, keyed by the chat they were sent to. */
+  const pendingQuestions = new Map<string, { questionId: string; options: NormalizedOption[] }>();
 
   // -- inbound handling --
 
@@ -565,6 +623,83 @@ export function createSignalAdapter(config: {
     }
   }
 
+  /**
+   * Read one downloaded signal-cli attachment into a base64 payload.
+   * Returns null when the file is missing, unreadable, or over the inline
+   * cap — the caller turns that into a visible note.
+   */
+  function readAttachment(att: SignalRawAttachment, chatId: string, typeHint?: string): SignalAttachment | null {
+    if (!att.id) return null;
+    const attachmentPath = join(config.signalDataDir, 'attachments', att.id);
+    if (!existsSync(attachmentPath)) {
+      log.warn('Signal: attachment file not found', { platformId: chatId, id: att.id, path: attachmentPath });
+      return null;
+    }
+    let bytes: Buffer;
+    try {
+      const { size } = statSync(attachmentPath);
+      if (size > config.maxInlineAttachmentBytes) {
+        log.warn('Signal: inbound attachment over inline cap, skipping', {
+          platformId: chatId,
+          id: att.id,
+          size,
+          cap: config.maxInlineAttachmentBytes,
+        });
+        return null;
+      }
+      bytes = readFileSync(attachmentPath);
+    } catch (err) {
+      log.warn('Signal: failed to read inbound attachment', { platformId: chatId, id: att.id, err });
+      return null;
+    }
+    log.info('Signal: attachment received', {
+      platformId: chatId,
+      id: att.id,
+      filename: att.filename,
+      contentType: att.contentType,
+      size: bytes.length,
+    });
+    return {
+      type: typeHint ?? signalAttachmentType(att.contentType),
+      // `name` is left off when signal-cli reports none, so the host's
+      // `deriveAttachmentName` can build an extensioned name from mimeType.
+      ...(att.filename ? { name: att.filename } : {}),
+      ...(att.contentType ? { mimeType: att.contentType } : {}),
+      size: bytes.length,
+      data: bytes.toString('base64'),
+    };
+  }
+
+  /**
+   * Read every attachment on a message into base64 `data`. The host stages
+   * the bytes into the session inbox (session-manager
+   * `extractAttachmentFiles`) and rewrites each entry to a `localPath` the
+   * container can read. A host path would be a dead reference: signal-cli's
+   * attachments directory is not mounted into agent containers. Same
+   * contract the iMessage adapter follows.
+   *
+   * Shared by the normal inbound path and the Note-to-Self sync path, which
+   * both carry attachments the agent should see.
+   */
+  function stageAttachments(
+    raw: SignalRawAttachment[],
+    chatId: string,
+    voiceNote?: SignalRawAttachment,
+  ): { attachments: SignalAttachment[]; note: string } {
+    const attachments: SignalAttachment[] = [];
+    const failures: string[] = [];
+    for (const att of raw) {
+      const isVoiceNote = voiceNote !== undefined && att === voiceNote;
+      const staged = readAttachment(att, chatId, isVoiceNote ? 'voice' : undefined);
+      if (staged) attachments.push(staged);
+      else failures.push(isVoiceNote ? 'voice message' : att.filename || 'attachment');
+    }
+    // Surface unreadable attachments rather than dropping them silently — the
+    // agent should be able to say "that file didn't come through".
+    const note = failures.map((f) => `[${f} could not be read]`).join(' ');
+    return { attachments, note };
+  }
+
   async function handleEnvelope(envelope: SignalEnvelope): Promise<void> {
     if (!setup) return;
 
@@ -575,22 +710,29 @@ export function createSignalAdapter(config: {
       // "Note to Self" — destination is our own account
       if (dest === config.account) {
         const text = (syncSent.message ?? '').trim();
-        if (!text) return;
+        // A file noted to self carries no caption, so text alone is not the
+        // test for whether there is anything here worth waking the agent for.
+        const syncAttachments = syncSent.attachments?.filter((a) => a.id) ?? [];
+        if (!text && syncAttachments.length === 0) return;
         const platformId = config.account;
-        if (echoCache.isEcho(platformId, text)) return;
+        if (text && echoCache.isEcho(platformId, text)) return;
         const timestamp = syncSent.timestamp ? new Date(syncSent.timestamp).toISOString() : new Date().toISOString();
 
         setup.onMetadata(platformId, 'Note to Self', false);
+
+        const { attachments: syncRefs, note: syncNote } = stageAttachments(syncAttachments, platformId);
+        const syncText = syncNote ? (text ? `${text}\n${syncNote}` : syncNote) : text;
 
         const msg: InboundMessage = {
           id: String(syncSent.timestamp ?? Date.now()),
           kind: 'chat',
           content: {
-            text,
+            text: syncText,
             sender: config.account,
             senderId: `signal:${config.account}`,
             senderName: 'Me',
             isFromMe: true,
+            ...(syncRefs.length > 0 ? { attachments: syncRefs } : {}),
             ...(syncSent.quote ? quoteToContent(syncSent.quote) : {}),
           },
           // Note-to-self is a DM with ourselves: same DM→mention rule.
@@ -611,11 +753,15 @@ export function createSignalAdapter(config: {
     const rawText = (dataMessage.message ?? '').trim();
     const text = rawText ? resolveMentions(rawText, dataMessage.mentions) : '';
 
-    const audioAttachment = dataMessage.attachments?.find((a) => a.contentType?.startsWith('audio/') && a.id);
-    const imageAttachments = dataMessage.attachments?.filter((a) => a.contentType?.startsWith('image/') && a.id) ?? [];
+    // Every attachment signal-cli downloaded, whatever its type. Filtering to
+    // image/audio here is what used to make PDFs and other documents vanish:
+    // sent with text only the text arrived, sent alone the message was
+    // dropped before the agent ever woke.
+    const attachments = dataMessage.attachments?.filter((a) => a.id) ?? [];
+    const audioAttachment = attachments.find((a) => a.contentType?.startsWith('audio/'));
     const hasVoice = !text && !!audioAttachment;
 
-    if (!text && !hasVoice && imageAttachments.length === 0) return;
+    if (!text && attachments.length === 0) return;
 
     const sender = (envelope.sourceNumber ?? envelope.sourceUuid ?? envelope.source ?? '').trim();
     if (!sender) return;
@@ -635,6 +781,28 @@ export function createSignalAdapter(config: {
       log.debug('Signal: skipping echo', { platformId });
       return;
     }
+
+    // A slash-command reply answering an outstanding ask_question routes to
+    // onAction instead of waking the agent with the raw "/approve" text. The
+    // owner DM is wired engage_pattern='.', so without this early return the
+    // reply would also be delivered to the agent as an ordinary message.
+    const pending = pendingQuestions.get(platformId);
+    if (pending && text.trim().startsWith('/')) {
+      const cmd = text.trim().toLowerCase();
+      const matched = pending.options.find((o) => optionToCommand(o.label) === cmd);
+      if (matched) {
+        pendingQuestions.delete(platformId);
+        setup.onAction(pending.questionId, matched.value, sender);
+        await sendText(platformId, `${matched.selectedLabel} by ${senderName}`);
+        log.info('Signal question answered', {
+          platformId,
+          questionId: pending.questionId,
+          value: matched.value,
+        });
+        return;
+      }
+    }
+
     const timestamp = dataMessage.timestamp ? new Date(dataMessage.timestamp).toISOString() : new Date().toISOString();
 
     const chatName = groupInfo?.groupName ?? (isGroup ? `Group ${groupId?.slice(0, 8)}` : senderName);
@@ -662,25 +830,21 @@ export function createSignalAdapter(config: {
           content = '[Voice Message]';
         }
       } else {
+        // No marker written here: the staging read below fails on the same
+        // missing file and contributes one failure note for the message.
         log.warn('Signal: voice attachment file not found', {
           id: audioAttachment.id,
           path: attachmentPath,
         });
-        content = '[Voice Message - file not found]';
       }
     }
 
-    // Image attachments — emit `[Image: <path>]` lines so the agent's Read
-    // tool can pick them up, and surface the structured `attachments` array
-    // for consumers that prefer that shape. Without this, vision-capable
-    // models never see images sent over Signal.
-    const attachmentRefs: Array<{ path: string; contentType: string }> = [];
-    for (const img of imageAttachments) {
-      const imagePath = join(config.signalDataDir, 'attachments', img.id!);
-      const imageLine = `[Image: ${imagePath}]`;
-      content = content ? `${content}\n${imageLine}` : imageLine;
-      attachmentRefs.push({ path: imagePath, contentType: img.contentType || 'image/jpeg' });
-    }
+    const { attachments: attachmentRefs, note } = stageAttachments(
+      attachments,
+      platformId,
+      hasVoice ? audioAttachment : undefined,
+    );
+    if (note) content = content ? `${content}\n${note}` : note;
 
     const msg: InboundMessage = {
       id: String(dataMessage.timestamp ?? Date.now()),
@@ -726,13 +890,24 @@ export function createSignalAdapter(config: {
 
   // -- send helpers --
 
-  async function sendText(platformId: string, text: string): Promise<void> {
-    if (!connected || !tcp) return;
+  /**
+   * Returns the signal-cli send timestamp of the first chunk, which is the id
+   * Signal itself uses to address a message. Callers that only need delivery
+   * ignore it; the ask_question path reports it as the card's
+   * platform_message_id.
+   */
+  async function sendText(platformId: string, text: string): Promise<string | undefined> {
+    if (!connected || !tcp) return undefined;
 
     echoCache.remember(platformId, text);
 
     const MAX_CHUNK = 4000;
     const chunks = text.length <= MAX_CHUNK ? [text] : chunkText(text, MAX_CHUNK);
+
+    let firstId: string | undefined;
+    const noteId = (res: { timestamp?: number } | undefined): void => {
+      if (firstId === undefined && res?.timestamp != null) firstId = String(res.timestamp);
+    };
 
     for (const chunk of chunks) {
       try {
@@ -750,13 +925,13 @@ export function createSignalAdapter(config: {
         }
 
         try {
-          await tcp.rpc('send', params);
+          noteId(await tcp.rpc<{ timestamp?: number }>('send', params));
         } catch (styledErr) {
           if (textStyles.length > 0) {
             log.debug('Signal: textStyle rejected, retrying with markup');
             delete params.textStyle;
             params.message = chunk;
-            await tcp.rpc('send', params);
+            noteId(await tcp.rpc<{ timestamp?: number }>('send', params));
           } else {
             throw styledErr;
           }
@@ -767,6 +942,7 @@ export function createSignalAdapter(config: {
     }
 
     log.info('Signal message sent', { platformId, length: text.length });
+    return firstId;
   }
 
   /**
@@ -919,6 +1095,32 @@ export function createSignalAdapter(config: {
 
     async deliver(platformId: string, _threadId: string | null, message: OutboundMessage): Promise<string | undefined> {
       const content = message.content as Record<string, unknown> | string | undefined;
+
+      // ask_question → text plus slash-command replies. Signal has no cards,
+      // and without this branch the payload carries no `text` key, so the card
+      // fell through both sends below and was dropped with no error: the
+      // approval row stayed pending forever and nobody was told. See the
+      // matching reply handler in handleEnvelope.
+      if (content && typeof content === 'object' && content.type === 'ask_question' && content.questionId) {
+        const questionId = content.questionId as string;
+        const title = content.title as string;
+        const question = (content.question as string) ?? '';
+        if (!title || !content.options) {
+          log.error('Signal: ask_question missing required title/options — skipping delivery', { questionId });
+          return undefined;
+        }
+        const options = normalizeOptions(content.options as never);
+        const lines = options.map((o) => `  ${optionToCommand(o.label)} — ${o.label}`).join('\n');
+        const body = `**${title}**\n\n${question}\n\nReply with:\n${lines}`;
+        const msgId = await sendText(platformId, body);
+        pendingQuestions.set(platformId, { questionId, options });
+        if (pendingQuestions.size > PENDING_QUESTIONS_MAX) {
+          const oldest = pendingQuestions.keys().next().value;
+          if (oldest !== undefined) pendingQuestions.delete(oldest);
+        }
+        return msgId;
+      }
+
       let text: string | null = null;
       if (typeof content === 'string') {
         text = content;
@@ -957,6 +1159,14 @@ export function createSignalAdapter(config: {
 // Self-registration
 // ---------------------------------------------------------------------------
 
+/**
+ * Inbound attachments are carried base64-inline through the session DB, so a
+ * very large file would bloat the row before the host ever stages it. Signal
+ * allows ~100MB; 20MB matches the iMessage adapter's cap and covers ordinary
+ * documents and photos. Override with SIGNAL_MAX_INLINE_ATTACHMENT_BYTES.
+ */
+const DEFAULT_MAX_INLINE_ATTACHMENT_BYTES = 20 * 1024 * 1024;
+
 const DEFAULT_TCP_HOST = '127.0.0.1';
 const DEFAULT_TCP_PORT = 7583;
 
@@ -983,6 +1193,7 @@ registerChannelAdapter('signal', {
       'SIGNAL_CLI_PATH',
       'SIGNAL_MANAGE_DAEMON',
       'SIGNAL_DATA_DIR',
+      'SIGNAL_MAX_INLINE_ATTACHMENT_BYTES',
     ]);
 
     const account = process.env.SIGNAL_ACCOUNT || envVars.SIGNAL_ACCOUNT || '';
@@ -1011,6 +1222,10 @@ registerChannelAdapter('signal', {
       }
     }
 
+    const maxInlineAttachmentBytes =
+      Number(process.env.SIGNAL_MAX_INLINE_ATTACHMENT_BYTES || envVars.SIGNAL_MAX_INLINE_ATTACHMENT_BYTES) ||
+      DEFAULT_MAX_INLINE_ATTACHMENT_BYTES;
+
     return createSignalAdapter({
       cliPath,
       account,
@@ -1018,6 +1233,7 @@ registerChannelAdapter('signal', {
       tcpPort,
       manageDaemon,
       signalDataDir,
+      maxInlineAttachmentBytes,
     });
   },
   defaults: SIGNAL_DEFAULTS,
