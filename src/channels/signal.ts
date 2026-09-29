@@ -700,6 +700,45 @@ export function createSignalAdapter(config: {
     return { attachments, note };
   }
 
+  /**
+   * Route a slash-command reply that answers an outstanding ask_question to
+   * onAction instead of waking the agent with the raw "/approve" text. The
+   * owner DM is wired engage_pattern='.', so without the caller's early return
+   * the reply would also reach the agent as an ordinary message.
+   *
+   * Called from BOTH inbound paths. A Signal install whose SIGNAL_ACCOUNT is
+   * the operator's own number talks to the agent through Note to Self, and
+   * those arrive as syncMessage.sentMessage, never as a dataMessage — so a
+   * dataMessage-only check silently never fires on exactly the setup that
+   * needs it most.
+   *
+   * Returns true when the caller must stop processing this envelope.
+   */
+  async function tryAnswerPendingQuestion(
+    platformId: string,
+    text: string,
+    senderId: string,
+    senderLabel: string,
+  ): Promise<boolean> {
+    if (!setup) return false;
+    const pending = pendingQuestions.get(platformId);
+    if (!pending || !text.trim().startsWith('/')) return false;
+
+    const cmd = text.trim().toLowerCase();
+    const matched = pending.options.find((o) => optionToCommand(o.label) === cmd);
+    if (!matched) return false;
+
+    pendingQuestions.delete(platformId);
+    setup.onAction(pending.questionId, matched.value, senderId);
+    await sendText(platformId, `${matched.selectedLabel} by ${senderLabel}`);
+    log.info('Signal question answered', {
+      platformId,
+      questionId: pending.questionId,
+      value: matched.value,
+    });
+    return true;
+  }
+
   async function handleEnvelope(envelope: SignalEnvelope): Promise<void> {
     if (!setup) return;
 
@@ -716,6 +755,10 @@ export function createSignalAdapter(config: {
         if (!text && syncAttachments.length === 0) return;
         const platformId = config.account;
         if (text && echoCache.isEcho(platformId, text)) return;
+        // Note to Self is how an operator whose own number IS the bot account
+        // answers an approval card, so this path needs the same interception
+        // as a normal DM.
+        if (await tryAnswerPendingQuestion(platformId, text, config.account, 'you')) return;
         const timestamp = syncSent.timestamp ? new Date(syncSent.timestamp).toISOString() : new Date().toISOString();
 
         setup.onMetadata(platformId, 'Note to Self', false);
@@ -782,26 +825,7 @@ export function createSignalAdapter(config: {
       return;
     }
 
-    // A slash-command reply answering an outstanding ask_question routes to
-    // onAction instead of waking the agent with the raw "/approve" text. The
-    // owner DM is wired engage_pattern='.', so without this early return the
-    // reply would also be delivered to the agent as an ordinary message.
-    const pending = pendingQuestions.get(platformId);
-    if (pending && text.trim().startsWith('/')) {
-      const cmd = text.trim().toLowerCase();
-      const matched = pending.options.find((o) => optionToCommand(o.label) === cmd);
-      if (matched) {
-        pendingQuestions.delete(platformId);
-        setup.onAction(pending.questionId, matched.value, sender);
-        await sendText(platformId, `${matched.selectedLabel} by ${senderName}`);
-        log.info('Signal question answered', {
-          platformId,
-          questionId: pending.questionId,
-          value: matched.value,
-        });
-        return;
-      }
-    }
+    if (await tryAnswerPendingQuestion(platformId, text, sender, senderName)) return;
 
     const timestamp = dataMessage.timestamp ? new Date(dataMessage.timestamp).toISOString() : new Date().toISOString();
 

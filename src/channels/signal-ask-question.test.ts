@@ -85,6 +85,23 @@ async function startFakeDaemon(): Promise<FakeDaemon> {
   };
 }
 
+/**
+ * A Note-to-Self envelope: how an install whose SIGNAL_ACCOUNT is the
+ * operator's own number actually receives operator messages. signal-cli
+ * reports these as syncMessage.sentMessage addressed to our own account,
+ * never as a dataMessage — the shape that made a dataMessage-only
+ * interception silently never fire on a real install.
+ */
+function noteToSelfEnvelope(text: string): Record<string, unknown> {
+  return {
+    source: ACCOUNT,
+    sourceNumber: ACCOUNT,
+    syncMessage: {
+      sentMessage: { message: text, destination: ACCOUNT, destinationNumber: ACCOUNT, timestamp: Date.now() },
+    },
+  };
+}
+
 /** A signal-cli inbound DM envelope carrying `text` from ADMIN. */
 function dmEnvelope(text: string): Record<string, unknown> {
   return {
@@ -237,6 +254,44 @@ describe('signal ask_question delivery', () => {
     daemon.push(dmEnvelope('/reject'));
     await vi.waitFor(() => expect(inbound).toHaveLength(1));
     expect(actions).toHaveLength(1);
+  });
+
+  it("answers from Note to Self, where SIGNAL_ACCOUNT is the operator's own number", async () => {
+    await adapter.deliver(ACCOUNT, null, {
+      kind: 'chat-sdk',
+      content: {
+        type: 'ask_question',
+        questionId: 'appr-test-nts',
+        title: 'Install Packages Request',
+        question: 'Orac wants to install cowsay.',
+        options: APPROVAL_OPTIONS,
+      },
+    });
+
+    daemon.push(noteToSelfEnvelope('/approve'));
+    await vi.waitFor(() => expect(actions).toHaveLength(1));
+
+    expect(actions[0].questionId).toBe('appr-test-nts');
+    expect(actions[0].value).toBe('approve');
+    expect(inbound).toHaveLength(0);
+  });
+
+  it('still forwards an ordinary Note-to-Self message to the agent', async () => {
+    await adapter.deliver(ACCOUNT, null, {
+      kind: 'chat-sdk',
+      content: {
+        type: 'ask_question',
+        questionId: 'appr-test-nts2',
+        title: 'Install Packages Request',
+        question: 'Orac wants to install cowsay.',
+        options: APPROVAL_OPTIONS,
+      },
+    });
+
+    daemon.push(noteToSelfEnvelope('what is cowsay?'));
+    await vi.waitFor(() => expect(inbound).toHaveLength(1));
+
+    expect(actions).toHaveLength(0);
   });
 
   it('skips an ask_question with no title rather than sending a headless card', async () => {
