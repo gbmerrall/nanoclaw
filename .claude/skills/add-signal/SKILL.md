@@ -31,6 +31,7 @@ into `src/channels/` (overwrite — the branch is canonical):
 ```nc:copy from-branch:channels
 src/channels/signal.ts
 src/channels/signal-registration.test.ts
+src/channels/signal-ask-question.test.ts
 ```
 
 ### 3. Register the adapter
